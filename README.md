@@ -1,6 +1,6 @@
 # Food-Access-Program
 
-Take home data challenge
+Proposed Food Access Access program in the US.
 
 Uses the following Datasets
 
