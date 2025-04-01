@@ -1,0 +1,347 @@
+---
+title: "N1 Health Take-Home Data Challenge"
+author: "Veronica Upadhyay"
+date: "2025-03-25"
+output: html_document
+---
+# Overview
+Food retailers produce considerable food waste in the US due to factors like overstocking, consumer demand, and expiration dates ([Food Waste Feast](https://foodwastefeast.com/why-we-waste-ugly-food-expiration-dates-and-more)). I propose deploying food access programs that redistribute surplus produce from nearby *potential* Food Donors (grocery stores, convenience stores, and farmers markets) to nearby food insecure communities. While many major retailers already contribute to food banks and pantries, this initiative expands the effort by incorporating farmers markets, ensuring that cosmetically imperfect but nutritious produce from all potential donors are not wasted.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(maps)
+library(ggthemes)
+library(tidyverse)
+library(sf)
+library(ggplot2)
+library(ggmap)
+library(cluster)
+library(knitr)
+```
+
+### Dataset Prep
+#### Load Datasets
+CDC - [500 Cities Project](https://chronicdata.cdc.gov/500-Cities/500-Cities-Census-Tract-level-Data-GIS-Friendly-Fo/k86t-wghb) (*Last Updated 12/5/2019*)
+
+FDA – [Food Atlas](https://www.ers.usda.gov/data-products/food-environment-atlas/data-access-and-documentation-downloads/) (*Last Updated 9/10/2020*)
+
+```{r}
+# CDC
+CDC_Raw <- 
+  read.csv("/Users/veronicaupadhyay/Downloads/N1Health_DataChallenge/500_Cities__Census_Tract-level_Data__GIS_Friendly_Format___2019_release_20250325.csv")
+
+# FDA; State & County Data
+FDA_Raw <- 
+  read.csv("/Users/veronicaupadhyay/Downloads/N1Health_DataChallenge/FoodEnvironmentAtlas/StateAndCountyData.csv")
+```
+
+#### FDA: Living Circumstance Variables
+I selected a few variables from the 280+ options that may give insights on the living circumstances among each community—- insights such as food insecurity rates, prevalence of potential Food Donors like grocery stores and farmers markets, and the presence of existing food assistance programs.
+
+[Variable operational definitions](https://www.ers.usda.gov/data-products/food-access-research-atlas/documentation#definitions)
+
+```{r}
+FDA_Select <- FDA_Raw %>%
+  
+  # Variable names are stored by row; select a few vars and PIVOT
+  filter(Variable_Code %in% c(
+    # Low income & low access to store (%), 2010
+    "PCT_LACCESS_LOWI10", 
+    # Households, no car & low access to store (%), 2015                          
+    "PCT_LACCESS_HHNV15", 
+    # SNAP households, low access to store (%), 2015
+    "PCT_LACCESS_SNAP15", # Note: more likely to engage with other programs? 
+    # SNAP-authorized stores/1,000 pop, 2017
+    "SNAPSPTH17",
+    # Recreation & fitness facilities/1,000 pop, 2016
+    "RECFACPTH16",
+    
+    # Household food insecurity (%, three-year average), 2015-17*,
+    "FOODINSEC_15_17",
+    # Household very low food security (%, three-year average), 2015-17*
+    "VLFOODSEC_15_17",
+    
+    #--- potential donors
+    # Grocery stores/1,000 pop, 2016
+    "GROCPTH16",
+    # Supercenters & club stores/1,000 pop, 2016
+    "SUPERCPTH16",
+    # Convenience stores/1,000 pop, 2016 
+    "CONVSPTH16",
+    # Specialized food stores/1,000 pop, 2016 
+    "SPECSPTH16",
+    # Full-service restaurants/1,000 pop, 2016
+    "FSRPTH16",
+    # Farms with direct sales, 2012
+    "DIRSALES_FARMS12",
+    # Farmers' markets/1,000 pop, 2018
+    "FMRKTPTH18",
+    # Vegetable acres harvested/1,000 pop, 2012
+    "VEG_ACRESPTH12",
+    # Food hubs, 2018
+    "FOODHUB18"
+  )) %>%
+
+  pivot_wider(names_from= Variable_Code, 
+              values_from= Value)
+```
+
+#### CDC: Health Circumstance Variables
+I selected a few variables from the ~60 options that may give insights on the health circumstances among each community—- insights such as health accessibility, habitual health checkups, unhealthy social habits, etc.
+
+```{r}
+CDC_Select <- CDC_Raw %>%
+  select(
+    # Background Info
+    "StateAbbr", "PlaceName", "PlaceFIPS", "TractFIPS", 
+    "Place_TractID", "Population2010", "Geolocation", 
+    
+    # Doctor visits, indicator of health accessibility
+    "CHECKUP_CrudePrev", "DENTAL_CrudePrev",
+    
+    # Unhealthy social habits, indicator of minimal unhealthy- cycle-breaker interventions (?)
+    "BINGE_CrudePrev", "CSMOKING_CrudePrev",
+    
+    # Bad dental, indicator of long- term poverty
+    "TEETHLOST_CrudePrev",
+    
+    # NIH: "Individual-level poverty [...] substantial cancer risk 
+    # [...] increased exposure to carcinogens, low educational attainment, and lack of access to care
+    "CANCER_CrudePrev",
+    
+    # Is there Gender disparity? then targeted approach
+      #  Basic cares: Flu shot past year, PPV shot ever, Colorectal cancer screening, 2016 [vs] THAT + Mammogram
+    "COREM_CrudePrev", "COREW_CrudePrev",
+      # Do food-insecure women skip preventive care?
+    "MAMMOUSE_CrudePrev", "PAPTEST_CrudePrev" 
+          # Recall from STOR425: women cost more to cover
+          # Women drop $15 billion more annually on medical expenses than men
+  )
+```
+
+#### Merge CDC with FDA
+Merge CDC with FDA dataset based on FIPS variables.
+
+- CDC dataset: $TractFIPS$:- first 5 vals for county
+
+- FDA dataset: $FIPS$:- 5 vals already for county
+```{r}
+# Trim CDC to county digits
+CDC_Select <- CDC_Select %>%
+  mutate(CountyFIPS = substr(TractFIPS, 1,5))
+
+# Must mutate FDA to chr for merge
+FDA_Select <- FDA_Select %>% mutate(FIPS = as.character(FIPS))
+
+# Merge based on County FIPS
+All_Raw <- left_join(CDC_Select, FDA_Select, by = c("CountyFIPS" = "FIPS"))
+
+  # DataCheck: few CDC columns w NA and many FDA cols with NAs; just remove NAs rows later if need
+  # colSums(is.na(All_Raw))
+
+# Establish lat and long cols instead of Geolocation, for map building
+All_Raw <- All_Raw %>%
+     # delete parenthesis
+  mutate(Geolocation = gsub("[()]", "", Geolocation)) %>% 
+  separate(Geolocation, into = c("Latitude", "Longitude"), sep = ",") %>%
+  mutate(Latitude = as.numeric(Latitude), Longitude = as.numeric(Longitude))
+```
+
+# Investigation 
+A program combining Food Banks and Mobile Food Banks can be effective way to redistribute surplus foods. Surplus produce and foods from Food Donors (grocery stores, convenience stores, and farmers markets) can be donated to a Food Bank, then a Mobile Food Bank can travel to and set-up in a food insecure sub-cluster for a full work- day and distribute this surplus foods. 
+
+![Image Description: Proposed Food Program](/Users/veronicaupadhyay/Downloads/N1Health_DataChallenge/FoodProgramDiagram.png)
+
+
+
+## Broad Examination: US Map of Food Insecurity
+
+To identify the states with high priority needs for a food access program, I designed a choropleth map visualizing the most food- insecure states in the country by *averaging the food insecurity rates within each state. 
+
+According to the map, New York, Minnesota, and Louisiana are among the top most food insecure states in the country. It is sensible to prioritize implementing the most number food access programs in those three states first. 
+
+**Data Flaw:-** Six states did not have metrics on food insecurity. Considering California's significant population, for instance, it may be useful to pull additional datasets to understand the state's food insecurity ranking versus the other US states.
+
+**Data Flaw 2:-** *In the FDA dataset, a single state has been marked with the same food insecurity rating regardless of city or geolocation; currently, averaging food insecurity rates is redundant.
+
+```{r warning=FALSE}
+# Group Houshold Food Insecurity by State
+byState_FOODINSEC_15_17 <- All_Raw %>% group_by(State) %>%
+  summarise(avg_FOODINSEC = mean(FOODINSEC_15_17, na.rm=TRUE)) %>%
+  arrange(desc(avg_FOODINSEC)) %>%
+  filter(!(is.na(avg_FOODINSEC))) # was Warning about 1 removd NAn row
+
+# State abbreviations into full form 
+MAP_statesearch <- data.frame(ShortState = state.abb, FullState = tolower(state.name))
+MAP_FOODINSEC_15_17 <- byState_FOODINSEC_15_17 %>%
+  left_join(MAP_statesearch, by = c("State" = "ShortState")) 
+
+# Pull longlat coordinates for states with map_data() fx
+MAP_longlat <- left_join( map_data("state") , MAP_FOODINSEC_15_17, by = c("region" = "FullState"))
+
+  # plot Food insecurity US map
+ggplot(MAP_longlat, aes(x = long, y = lat, group = group, fill = avg_FOODINSEC)) +
+  
+  # draw borders
+  geom_polygon(color = "white", size = 0.2) + 
+  
+  # fill in gradient of food insecurity
+  scale_fill_gradient(na.value = "grey",low = "gold", high = "red") + 
+  
+  # erase background coordinate plane
+  theme_void() +
+  
+  labs(title = "Food Insecurity Rate, 2015 to 2017", 
+       fill = "Food Insecurity (%)")+
+  
+  theme(legend.position = "right", plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+## Focused Examination: New York State
+
+Let's focus on implementing a Food Bank + Mobile Food Bank program in New York State, one of the most food insecure states. Within NY state, I identified the geolocations that have the **best access** to potential food donors—- meaning, communities that have the top 75% access to Grocery stores OR top 75% access to convenience stores and farmers markets. Grocery stores alone can work as a significant contribute to Food Banks as many large grocery chains have existing food donation programs. However, a combination of donations from convenience stores and farmers markets can also provide considerable supply to Food Banks. Placing food banks closest to the potential Donors are most likely encourage surplus food donations.
+
+I use K means clustering to find 3 (can increase this value based on funding) of these **best access** clusters. These are the optimal sites for food banks. However, I arbitrarily selected "3" to be the number of food banks in NY; I suggest placing equal number of food banks between NY, MN, and LA, given that these are the most food insecure states, and decrease (if limited by funding) the number of food banks built based on each State's Food Insecurity rank. 
+
+**Data Flaw:-** Food insecurity is marked the same across an entire state in FDA food atlas; NY, regardless of city, has a food insecurity rating of 17.9. It may be useful to pull additional datasets to understand a city- by- city or— ideally— household- by household status of food insecurity so that the red dots are more meaningful. I have included code to filtering the top most food insecure Geolocations once data for that is available.
+
+**Data Flaw 2:-** It would also be useful to have the locations of potential Food Donors across the state; currently I am only assuming communities with high % access to Grocery and Convenience stores and Farmers markets are nearest to stores. I have included code to mark these locations with blue dots once that data is accessible.
+
+```{r}
+# NY state, the most food-insecure state
+NY_All <- All_Raw %>% filter(StateAbbr == "NY")
+
+# Potential Food Donors-----------
+# Golocations with the best access to potential food donors Groceries, Convenience stores, Farmers market
+      # Lets define best access as TOP 75%
+NY_TopPotentialDonors <- NY_All %>%
+  summarise(across(c(GROCPTH16, CONVSPTH16, FMRKTPTH18), ~ quantile(.x, 0.75, na.rm=TRUE))) 
+
+# Filter for those census tract centroid that have the *best access* to donors
+NY_FoodDonors <- NY_All %>%
+  filter(GROCPTH16 >= NY_TopPotentialDonors$GROCPTH16 | 
+         CONVSPTH16 >= NY_TopPotentialDonors$CONVSPTH16 & # combo of conv and farmers markets 
+         FMRKTPTH18 >= NY_TopPotentialDonors$FMRKTPTH18) %>%
+  select(Latitude, Longitude, GROCPTH16, CONVSPTH16, FMRKTPTH18)
+
+
+
+# Food Insecure locations ---------- 
+# TOP 90% most food insecure
+NY_TopFoodInsecure <- NY_All %>%
+  summarise(FoodInsec_Threshold = quantile(FOODINSEC_15_17, 0.90, na.rm=TRUE))
+NY_FoodInsecure <- NY_All %>%
+  filter(FOODINSEC_15_17 >= NY_TopFoodInsecure$FoodInsec_Threshold) %>%
+  select(Latitude, Longitude, FOODINSEC_15_17)
+
+# ----
+# Kmeans() to pick the best Food bank based on geo location
+set.seed(100) 
+NY_kmeansClusters <- kmeans(NY_FoodDonors[,c("Latitude", "Longitude")], 
+                        centers = 3) # Food bank/ cluster amt can change
+   #summary(NY_kmeansClusters)
+
+#   Cluster labels
+NY_FoodDonors <- NY_FoodDonors %>%
+  mutate(Food_Bank = as.factor(NY_kmeansClusters$cluster)) # 1, 2, 3
+
+# ---
+# Where are the 3 proposed food banks
+NY_BankLocations <- as.data.frame(NY_kmeansClusters$centers)
+  colnames(NY_BankLocations) <- c("Latitude", "Longitude")
+  NY_BankLocations$Hub <- factor(1:nrow(NY_BankLocations)) # number the 3 locs
+
+# ----
+# Get NY state boundary limits
+NY_BorderDraw <- map_data("state") %>% filter(region == "new york")
+
+ggplot() +
+  # Draw NY border
+  geom_polygon(data = NY_BorderDraw, aes(x= long, y = lat, group =group),
+               fill=NA, color = "black", size= 0.5) +
+  
+    # potential Food_Donors
+  #geom_point(data = NY_FoodDonors, aes(x = Longitude, y = Latitude),
+             #color = "blue", size = 2, alpha = 0.6) +  # Blue dots for donors
+
+  # Draw food-insecure communities in red
+  geom_point(data = NY_FoodInsecure, aes(x = Longitude, y = Latitude),
+             color = "orangered", size = 1, alpha = 0.2) +
+
+  # Star Food Bank
+  geom_point(data = NY_BankLocations, aes(x = Longitude, y = Latitude), 
+             color = "black", shape = 8, size = 5) +  # Star shape for hubs
+
+  labs(title = "NY State: Proposed Food Bank Hubs",
+       subtitle = "Black stars = Proposed Food Bank | Red = Food-Insecure Communities") +
+
+# erase background coordinate plane
+  theme_void() 
+```
+
+## Assessing Engagement
+Individuals who value personal well being by staying up to date on routine healthcare—- doctor’s visits, dental checkups, and essential vaccinations—- are more likely to engage with these initiatives.Also, word- of- mouth referrals are an effective way to increase participation in localized programs; communities who have established faith in their healthcare providers may also learn about Food Access programs from their providers. Hence, I am incorporating doctors + dental visits, and essential- vaccine- completions as markers of potential engagement.
+
+For each state, it is appears that of the population that is food insecure, roughly half may be engaged with the program given the assumption that food insecure individuals who are engaged in healthful living are likely to engage in community food programs.
+
+**Data Flaw:-** It may be useful to bring in data on community hubs; understanding the prevalence of churches, community centers, etc., as well as percentage of the community that is involved with these hubs can provide more accurate insights into the estimate of people engaged in the Food Access program.
+
+```{r}
+# Estimate engagement with percent of individuals who have demonstrated engagement with healthcare checkups
+All_Raw <- All_Raw %>%
+  mutate(
+    # # of the population that is Food Insecure
+    FoodInsecCount = (FOODINSEC_15_17 / 100) * Population2010,
+    # Engaged in healthful living -> engaged in community food programs
+    Health_Engagement = (CHECKUP_CrudePrev + DENTAL_CrudePrev + COREW_CrudePrev + COREM_CrudePrev) / 4,
+    # Food insecure population engaged
+    FoodInsec_Engaged = (FoodInsecCount * Health_Engagement) / 100
+  )
+
+#  
+Table_All_Engaged <- All_Raw %>%
+  group_by(StateAbbr) %>%
+  summarise(
+    Total_Pop = sum(Population2010),
+    FoodInsecCount = sum(FoodInsecCount, na.rm = TRUE),
+    # average amount of people engaged in healthful living
+    Avg_Health_Engagement = mean(Health_Engagement, na.rm = TRUE),
+    FoodInsec_Engaged = sum(FoodInsec_Engaged, na.rm = TRUE)
+  ) %>%arrange(desc(FoodInsec_Engaged))
+
+kable(Table_All_Engaged, caption = "Estimated Engagement in Food Access Program")
+
+# Overlapping Bar Chart 
+ggplot(Table_All_Engaged, aes(x= reorder(StateAbbr, FoodInsec_Engaged))) +
+  
+  geom_bar(aes(y= FoodInsecCount), stat = "identity",fill= "gray80", show.legend = TRUE) +
+  
+  geom_bar(aes(y= FoodInsec_Engaged), stat = "identity",fill= "cadetblue", show.legend = TRUE) +
+  
+  coord_flip() +
+  
+  labs(title = "Estimated Engagement in Food Access Program", x = "State", y = "Population", fill = "Legend") +
+  
+  theme_gray(base_size = 7) 
+
+```
+
+
+# Further Investigation
+
+In addition to the **Data Flaws** I outlined, where I suggested additional datasets we can pull to fine tune these outcomes, there are few extending areas that can help us determine where and how to deploy this food access program. 
+
+## Beneficiary subgroup and projected impact
+Food insecurity rate was consistent throughout a single state; To truly understand which communities or cities *within* a state my benefit most, I would use variables like income level, employment status, and access to transportation to build logistic regression models to predict the the likelihood of a census tracked Centroid to experience food insecurity. 
+To understand the long- term impact upon these households, we would measure the increase in food availability per household. Given that the FDA dataset provides data on the SNAP program, we can examine how the percent change in SNAP authorized stores correlates with the change in obesity, diabetes, cholesterol rates. 
+SNAP incentivizes consumers to purchase healthier foods with coupons, discounts, and gift cards ([SNAP Healthy Incentives](https://www.fns.usda.gov/snap/healthy-incentives#:~:text=A%20key%20barrier%20to%20healthy,related%20chronic%20diseases%20and%20disparities.)). My proposed intervention encourages donations of healthy, surplus produce (hence the inclusion of farmers markets and dicussion of cosmetically imperfect foods). Therefore, we can use SNAP's impact to understand whether an increase in access to donated fresh produce has a complementary effect on the health outcomes.
+
+## Estimate engagement of potential Food Donors
+
+Even if we identify donor- dense areas, its not guaranteed that every donor will contribute equally. Variables such as past donations data, or logistical constraints like the capacity to store and transport food to Food Banks can be used to build linear regression models to estimate donor engagement.
+
+## Optimization models for Mobile Food Bank Routes
+The efficiency of the mobile food bank network will determine how much impact it can have. Given constraints such as funding, storage- time limits (perishable vs non- perishable foods), capacity of vehicles, road routes, etc., we can use an Linear programming to, say, minimize delivery cost or maxmimize pounds of food delivered.
